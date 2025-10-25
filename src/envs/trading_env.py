@@ -135,9 +135,11 @@ class OptimalExecutionEnv:
         P_next = P_t + noise - Delta_P_perm
 
         # 6. Calculate Risk-Averse Reward (Mean-Variance Utility)
-        # FIXED: Now uses episode-specific P_REF (set in reset())
-        # This measures slippage from the episode's starting price
-        risk_penalty = self.LAMBDA * (P_exec - self.P_REF) ** 2
+        # risk_penalty = self.LAMBDA * (P_exec - self.P_REF) ** 2
+        # Use slippage
+        relative_slippage = (P_exec - self.P_REF) / self.P_REF
+        risk_penalty = self.LAMBDA * (relative_slippage ** 2) * 10000
+
         R_t = Revenue_t - risk_penalty
 
         # 7. Check Termination
