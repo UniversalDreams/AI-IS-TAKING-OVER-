@@ -34,6 +34,14 @@ Action = float
 class OptimalExecutionEnv:
     def __init__(self, initial_shares: float, total_time_steps: int, lookback_window: int = 5):
 
+        # Validate inputs
+        if initial_shares <= 0:
+            raise ValueError(f"initial_shares must be positive, got {initial_shares}")
+        if total_time_steps <= 0:
+            raise ValueError(f"total_time_steps must be positive, got {total_time_steps}")
+        if lookback_window <= 0:
+            raise ValueError(f"lookback_window must be positive, got {lookback_window}")
+
         # Load environment data and calculated parameters (Sigma only)
         self.data_df, self.sigma = load_and_calculate_market_params()
 
@@ -93,6 +101,16 @@ class OptimalExecutionEnv:
         self.P_REF = P0
 
         initial_history = self._get_price_trend(self.episode_start_idx)
+
+        self.episode_metrics = {
+            'total_revenue': 0.0,
+            'total_penalty': 0.0,
+            'total_volume': 0.0,
+            'avg_slippage': 0.0,
+            'total_implementation_shortfall': 0.0,
+            'execution_prices': [],
+            'actions': []
+        }
 
         return OptimalExecutionState(
             current_price=P0,
@@ -166,7 +184,96 @@ class OptimalExecutionEnv:
             last_perm_impact=Delta_P_perm
         )
 
+        # Calculate implementation shortfall for tracking
+        implementation_shortfall = V_t * (self.P_REF - P_exec)
+
+        # Calculate slippage in basis points
+        slippage_bps = ((P_exec - self.P_REF) / self.P_REF) * 10000
+
+        # Enhanced info dictionary
+        info = {
+            # Execution metrics
+            'volume': V_t,
+            'volume_pct': V_t / self.X0,
+            'execution_price': P_exec,
+            'slippage': P_exec - self.P_REF,
+            'slippage_bps': slippage_bps,
+            'implementation_shortfall': implementation_shortfall,
+
+            # Market impact
+            'temporary_impact': self.ETA * V_t,
+            'permanent_impact': Delta_P_perm,
+
+            # State tracking
+            'inventory_remaining_pct': X_next / self.X0,
+            'time_progress': 1 - (t_next / self.T),
+
+            # Reward components
+            'revenue': Revenue_t,
+            'risk_penalty': risk_penalty,
+
+            # Episode tracking
+            'step': self.current_step,
+            'forced_liquidation': t_rem == 1
+        }
+
+        # Update episode metrics
+        self.episode_metrics['total_revenue'] += Revenue_t
+        self.episode_metrics['total_penalty'] += risk_penalty
+        self.episode_metrics['total_volume'] += V_t
+        self.episode_metrics['execution_prices'].append(P_exec)
+        self.episode_metrics['actions'].append(action)
+
+        if done:
+            # Compute episode-level metrics
+            self.episode_metrics['avg_slippage'] = (
+                    np.mean(self.episode_metrics['execution_prices']) - self.P_REF
+            )
+            info['episode_metrics'] = self.episode_metrics.copy()
+
         # Return new state, reward, done flag, and info dict (standard Gym API)
         return new_state, R_t, done, {}
+
+
+def get_twap_policy(self) -> float:
+    """
+    Returns the TWAP (Time-Weighted Average Price) action.
+
+    TWAP simply sells equal amounts each step: 1/T of remaining inventory.
+    This is the industry baseline to beat.
+    """
+    return 1.0 / self.T
+
+
+def run_twap_episode(self) -> Dict:
+    """
+    Run one episode using TWAP strategy for benchmarking.
+
+    Returns episode metrics.
+    """
+    state = self.reset()
+    total_reward = 0
+    metrics = {
+        'rewards': [],
+        'prices': [],
+        'volumes': [],
+        'slippages': []
+    }
+
+    while True:
+        action = self.get_twap_policy()
+        state, reward, done, info = self.step(state, action)
+
+        total_reward += reward
+        metrics['rewards'].append(reward)
+        metrics['prices'].append(info['execution_price'])
+        metrics['volumes'].append(info['volume'])
+        metrics['slippages'].append(info['slippage_bps'])
+
+        if done:
+            break
+
+    metrics['total_reward'] = total_reward
+    return metrics
 
 # --- End of trading_env.py ---
