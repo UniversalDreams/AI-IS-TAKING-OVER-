@@ -42,7 +42,7 @@ class OptimalExecutionEnv:
         if lookback_window <= 0:
             raise ValueError(f"lookback_window must be positive, got {lookback_window}")
 
-        # Load environment data and calculated parameters (Sigma only)
+        # Load environment data and calculated parameters
         self.data_df, self.sigma = load_and_calculate_market_params()
 
         # Fixed AC model parameters
@@ -57,10 +57,30 @@ class OptimalExecutionEnv:
         self.N = lookback_window        # How many historical returns to include
         self.max_index = len(self.data_df) - self.T
 
+        # ⭐ NEW: Precompute normalization statistics
+        self._price_mean = self.data_df['close'].mean()
+        self._price_std = self.data_df['close'].std()
+        self._price_min = self.data_df['close'].min()
+        self._price_max = self.data_df['close'].max()
+
+        # Typical impact magnitude (for normalization)
+        self._typical_impact = self.THETA * (self.X0 / self.T)
+
         # Internal state tracking
         self.current_step = 0
         self.episode_start_idx = 0
         self.P_REF = None  # Will be set in reset() to episode's starting price
+
+    # ⭐ NEW: Property methods for neural network
+    @property
+    def state_dim(self) -> int:
+        """Dimension of state space for neural network input."""
+        return 4 + self.N + 1  # price, inventory, time, vol + trend + impact
+
+    @property
+    def action_dim(self) -> int:
+        """Dimension of action space."""
+        return 1
 
     # Get the last N price movements (log returns) from historical data
     def _get_price_trend(self, idx: int) -> np.ndarray:
@@ -80,6 +100,33 @@ class OptimalExecutionEnv:
 
         return trend_data
 
+    # ⭐ NEW: State normalization for neural network
+    def normalize_state(self, state: OptimalExecutionState) -> np.ndarray:
+        """
+        Convert state to normalized numpy array for neural network.
+
+        Returns array of shape (state_dim,) with values roughly in [-1, 1].
+        """
+        return np.array([
+            # Price (z-score normalization)
+            (state.current_price - self._price_mean) / self._price_std,
+
+            # Inventory (as fraction of initial, range [0, 1])
+            state.inventory_left / self.X0,
+
+            # Time (as fraction remaining, range [0, 1])
+            state.time_remaining / self.T,
+
+            # Volatility (normalize by dataset volatility)
+            state.volatility / self.sigma,
+
+            # Price trend (already normalized log returns)
+            *state.price_trend_vector,
+
+            # Last permanent impact (normalize by typical impact)
+            state.last_perm_impact / max(self._typical_impact, 1e-8)
+        ], dtype=np.float32)
+
     def reset(self) -> OptimalExecutionState:
         """
         Resets the environment for a new episode.
@@ -95,13 +142,14 @@ class OptimalExecutionEnv:
         # Get starting price for this episode
         P0 = self.data_df['close'].iloc[self.episode_start_idx].item()
 
-        # CRITICAL FIX: Set P_REF to this episode's starting price
+        # Set P_REF to this episode's starting price
         # This makes the reward function measure "how well did I execute relative to my entry price"
         # rather than "how close am I to some arbitrary historical price"
         self.P_REF = P0
 
         initial_history = self._get_price_trend(self.episode_start_idx)
 
+        # ⭐ Initialize episode metrics tracking
         self.episode_metrics = {
             'total_revenue': 0.0,
             'total_penalty': 0.0,
@@ -121,8 +169,17 @@ class OptimalExecutionEnv:
             last_perm_impact=0.0
         )
 
-    # CORRECTED: Fixed return type hint with proper tuple contents
     def step(self, state: OptimalExecutionState, action: Action) -> Tuple[OptimalExecutionState, float, bool, Dict]:
+        """
+        Execute one trading step.
+
+        Args:
+            state: Current state
+            action: Percentage of inventory to sell (0-1)
+
+        Returns:
+            (next_state, reward, done, info)
+        """
         P_t = state.current_price
         X_t = state.inventory_left
         t_rem = state.time_remaining
@@ -131,17 +188,18 @@ class OptimalExecutionEnv:
         # 1. Action Validation and Volume Calculation
         A_t = np.clip(action, 0.0, 1.0)  # Ensure action is between 0% and 100%
 
-        # CRITICAL FIX: Force complete liquidation on final step
+        # Force complete liquidation on final step
         if t_rem == 1:
             V_t = X_t  # Sell all remaining inventory on last step
         else:
             V_t = A_t * X_t  # Volume traded in this step
 
-        # --- 2. Execution Price and Revenue (Temporary Impact) ---
+        # 2. Execution Price and Revenue (Temporary Impact)
         P_exec = P_t - (self.ETA * V_t)
         Revenue_t = V_t * P_exec
 
-        # 3. Next Unperturbed Price (Stochastic Noise / Market Risk)
+        # 3. Market Noise (Stochastic Price Movement)
+        # aka Next Unperturbed Price (Stochastic Noise / Market Risk)
         # Random Walk component: sigma * sqrt(delta_t) * Z_t (Z_t ~ N(0, 1))
         # Note the use of self.DELTA_T = 5.0 to amplify noise
         noise = sigma * np.sqrt(self.DELTA_T) * norm.rvs()
@@ -152,22 +210,21 @@ class OptimalExecutionEnv:
         # 5. Determine Next Market Price (P_{t+1})
         P_next = P_t + noise - Delta_P_perm
 
-        # 6. Calculate Risk-Averse Reward (Mean-Variance Utility)
-        # risk_penalty = self.LAMBDA * (P_exec - self.P_REF) ** 2
-        # Use slippage
+        # 6. Calculate Risk-Averse Reward (Revenue - Risk Penalty) (Mean-Variance Utility)
+        # Use relative slippage for scale-invariant penalty
         relative_slippage = (P_exec - self.P_REF) / self.P_REF
         risk_penalty = self.LAMBDA * (relative_slippage ** 2) * 10000
-
         R_t = Revenue_t - risk_penalty
 
-        # 7. Check Termination
+        # 7. Update State / Check termination
         X_next = X_t - V_t
         t_next = t_rem - 1
 
+        # Check termination
         # Episode ends when time runs out or inventory is fully liquidated
         done = (t_next <= 0) or (X_next <= 1e-6)
 
-        # 8. Update State Vector (S_{t+1})
+        # 8. Build Next State (Update State Vector (S_{t+1}))
         self.current_step += 1
 
         # Fetch the next price trend for the augmented belief state
@@ -184,40 +241,40 @@ class OptimalExecutionEnv:
             last_perm_impact=Delta_P_perm
         )
 
+        # 9. Calculate metrics for info dict
         # Calculate implementation shortfall for tracking
         implementation_shortfall = V_t * (self.P_REF - P_exec)
-
         # Calculate slippage in basis points
         slippage_bps = ((P_exec - self.P_REF) / self.P_REF) * 10000
 
-        # Enhanced info dictionary
+        # ⭐ Enhanced info dictionary
         info = {
             # Execution metrics
-            'volume': V_t,
-            'volume_pct': V_t / self.X0,
-            'execution_price': P_exec,
-            'slippage': P_exec - self.P_REF,
-            'slippage_bps': slippage_bps,
-            'implementation_shortfall': implementation_shortfall,
+            'volume': float(V_t),
+            'volume_pct': float(V_t / self.X0),
+            'execution_price': float(P_exec),
+            'slippage': float(P_exec - self.P_REF),
+            'slippage_bps': float(slippage_bps),
+            'implementation_shortfall': float(implementation_shortfall),
 
             # Market impact
-            'temporary_impact': self.ETA * V_t,
-            'permanent_impact': Delta_P_perm,
+            'temporary_impact': float(self.ETA * V_t),
+            'permanent_impact': float(Delta_P_perm),
 
             # State tracking
-            'inventory_remaining_pct': X_next / self.X0,
-            'time_progress': 1 - (t_next / self.T),
+            'inventory_remaining_pct': float(X_next / self.X0),
+            'time_progress': float(1 - (t_next / self.T)) if self.T > 0 else 1.0,
 
             # Reward components
-            'revenue': Revenue_t,
-            'risk_penalty': risk_penalty,
+            'revenue': float(Revenue_t),
+            'risk_penalty': float(risk_penalty),
 
             # Episode tracking
-            'step': self.current_step,
-            'forced_liquidation': t_rem == 1
+            'step': int(self.current_step),
+            'forced_liquidation': bool(t_rem == 1)
         }
 
-        # Update episode metrics
+        # ⭐ Update episode metrics
         self.episode_metrics['total_revenue'] += Revenue_t
         self.episode_metrics['total_penalty'] += risk_penalty
         self.episode_metrics['total_volume'] += V_t
@@ -231,49 +288,54 @@ class OptimalExecutionEnv:
             )
             info['episode_metrics'] = self.episode_metrics.copy()
 
-        # Return new state, reward, done flag, and info dict (standard Gym API)
-        return new_state, R_t, done, {}
+        # Return new state, reward, done flag, and info dict
+        return new_state, R_t, done, info
 
+    # ⭐ NEW: TWAP baseline methods
+    def get_twap_policy(self) -> float:
+        """
+        TWAP (Time-Weighted Average Price) baseline policy.
 
-def get_twap_policy(self) -> float:
-    """
-    Returns the TWAP (Time-Weighted Average Price) action.
+        Sells equal fractions each step: 1/T of remaining inventory.
+        This is the industry baseline to beat.
+        """
+        return 1.0 / self.T
 
-    TWAP simply sells equal amounts each step: 1/T of remaining inventory.
-    This is the industry baseline to beat.
-    """
-    return 1.0 / self.T
+    def run_twap_episode(self) -> Dict:
+        """
+        Run one episode using TWAP strategy for benchmarking.
 
+        Returns episode metrics.
+        """
+        state = self.reset()
+        total_reward = 0
+        metrics = {
+            'rewards': [],
+            'prices': [],
+            'volumes': [],
+            'slippages': []
+        }
 
-def run_twap_episode(self) -> Dict:
-    """
-    Run one episode using TWAP strategy for benchmarking.
+        while True:
+            action = self.get_twap_policy()
+            state, reward, done, info = self.step(state, action)
 
-    Returns episode metrics.
-    """
-    state = self.reset()
-    total_reward = 0
-    metrics = {
-        'rewards': [],
-        'prices': [],
-        'volumes': [],
-        'slippages': []
-    }
+            total_reward += reward
+            metrics['rewards'].append(reward)
+            metrics['prices'].append(info['execution_price'])
+            metrics['volumes'].append(info['volume'])
+            metrics['slippages'].append(info['slippage_bps'])
 
-    while True:
-        action = self.get_twap_policy()
-        state, reward, done, info = self.step(state, action)
+            if done:
+                break
 
-        total_reward += reward
-        metrics['rewards'].append(reward)
-        metrics['prices'].append(info['execution_price'])
-        metrics['volumes'].append(info['volume'])
-        metrics['slippages'].append(info['slippage_bps'])
+        metrics['total_reward'] = total_reward
+        return metrics
 
-        if done:
-            break
-
-    metrics['total_reward'] = total_reward
-    return metrics
+    # ⭐ NEW: Seed control for reproducibility
+    def seed(self, seed: int = None):
+        """Set random seed for reproducibility."""
+        if seed is not None:
+            np.random.seed(seed)
 
 # --- End of trading_env.py ---
