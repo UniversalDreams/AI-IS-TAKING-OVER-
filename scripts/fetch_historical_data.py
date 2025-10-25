@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 
 # --- Configuration Constants (Modify if needed) ---
 TICKER = "NVDA"
-MULTIPLIER = 1      # 5-minute bars
+MULTIPLIER = 1      # 1-minute bars
 TIMESPAN = "minute"
 # Adjusted date range to ensure total bar count is <= 50,000
 # (Approx. 8 months of trading days should fit)
@@ -21,7 +21,7 @@ MAX_LIMIT = 50000
 def fetch_polygon_data_and_save():
     """Fetches Polygon.io aggregate data and saves it to a local CSV."""
 
-    # 1. Load environment variables from.env file
+    # 1. Load envs variables from.env file
     load_dotenv()
 
     # 2. Retrieve API Key
