@@ -1,0 +1,16 @@
+# core
+numpy>=1.23
+pandas>=1.5
+matplotlib>=3.7
+
+# RL / envs (only if you use OpenAI Gym in main_torch.py)
+gymnasium>=0.29; python_version >= "3.9"
+# Box2D is needed for LunarLanderContinuous-v2; installation can be finicky, so optional:
+# box2d-py==2.3.8
+
+# TensorFlow (pick one that fits your platform; don't install both)
+tensorflow>=2.12,<2.16      # Linux/macOS Intel
+# tensorflow-macos==2.15.*  # Apple Silicon alternative (comment/uncomment as needed)
+
+# PyTorch (only if you run ddpg_torch.py)
+# torch>=2.1
