@@ -55,7 +55,7 @@ class OptimalExecutionEnv:
         self.X0 = initial_shares        # Initial shares to liquidate
         self.T = total_time_steps       # Total steps for episode
         self.N = lookback_window        # How many historical returns to include
-        self.max_index = len(self.data_df) - self.T
+        self.max_index = len(self.data_df) - (self.T * 5)
 
         # ⭐ NEW: Precompute normalization statistics
         self._price_mean = self.data_df['close'].mean()
@@ -229,7 +229,7 @@ class OptimalExecutionEnv:
 
         # Fetch the next price trend for the augmented belief state
         # Indexing for the history uses the original historical data index plus steps taken
-        history_index = self.episode_start_idx + self.current_step
+        history_index = self.episode_start_idx + (self.current_step * 5)
         next_trend = self._get_price_trend(history_index)
 
         new_state = OptimalExecutionState(
